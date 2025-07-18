@@ -43,6 +43,8 @@ def cd_to_root_dir():
     repo = Repo()
     assert repo.remotes.origin.url in [
         "git@github.com:llm-random/llm-random.git",
+        "git@github.com:CeramicTeam/ceramic-fine-grained-moe.git",
+        "https://github.com/CeramicTeam/ceramic-fine-grained-moe.git",
     ], "You're not in the right repo! Move to the llm-random folder, and make sure your origin is the llm-random repo. Aborting..."
     os.chdir(repo.working_dir)
 
@@ -75,9 +77,9 @@ def rsync_to_remote(host, local_dir):
 
 def get_base_directory(connection):
     if connection.host == "athena.cyfronet.pl":
-        base_dir = f"/net/pr2/projects/plgrid/plggllmeffi/{connection.user}/llm-random"
+        base_dir = f"/net/pr2/projects/plgrid/plggllmeffi/{connection.user}/ceramic-fine-grained-moe"
     else:
-        base_dir = f"~/llm-random"
+        base_dir = f"~/ceramic-fine-grained-moe"
     return base_dir
 
 
