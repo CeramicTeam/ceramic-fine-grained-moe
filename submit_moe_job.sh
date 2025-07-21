@@ -3,7 +3,7 @@
 #SBATCH --nodes=4
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
-#SBATCH --time=48:00:00
+#SBATCH --time=168:00:00
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
