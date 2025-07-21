@@ -40,6 +40,7 @@ srun bash -c "
         --n_blocks 12 \
         --dmodel 768 \
         --dff 3072 \
+        --effective_dff_x 4 \
         --n_att_heads 12 \
         --scheduler cosine \
         --learning_rate 0.0002 \
@@ -59,6 +60,11 @@ srun bash -c "
         --grad_clip 0.5 \
         --weight_decay 0.1 \
         --ff_mode expert_choice \
+        --softmax_over experts \
+        --layer_norm_in_expert_choice \
+        --group_granular_moe_by_batch \
+        --use_torch_bmm \
+        --granular_moe_one_hot_impl \
         --expansion_rate 16 \
         --granularity 4 \
         --fsdp_enabled \
@@ -76,7 +82,7 @@ srun bash -c "
         --gradient_accumulation_steps 1 \
         --logging_interval_loss 1000 \
         --logging_interval_heavy 5000 \
-        --eval_interval 5000 \
+        --eval_interval 1000 \
         --n_eval_batches 200 \
         --decoding_interval 0 \
         --project_name fine-grained-moe
