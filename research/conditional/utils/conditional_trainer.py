@@ -705,7 +705,7 @@ class ConditionalTrainer:
                 step,
                 self.batch_size,
                 self.cutoff,
-                self.logger.loggers,
+                self.logger.loggers if self.is_logging_process else None,
                 loss_accumulators=self.loss_accumulators,
                 correct_tokens_accumulator=self.correct_tokens_accumulator,
                 total_tokens_accumulator=self.total_tokens_accumulator,
