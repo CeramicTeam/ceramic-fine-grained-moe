@@ -5,6 +5,7 @@ import os
 import random
 from typing import Callable, Optional
 import socket
+import torch.nn.functional as F
 
 import torch
 import torch.multiprocessing as mp
@@ -67,6 +68,22 @@ from lizrd.train.load_and_save_model import (
     load_optimizer_state,
     prepare_save_weights_path,
 )
+
+
+def normalize_parameters(model: torch.nn.Module):
+    """
+    Normalize the weights of the model's layers to have unit norm.
+    This is performed after each optimizer step for nGPT.
+    """
+    for name, param in model.named_parameters():
+        # We only normalize weight tensors (2D or more) that require gradients
+        if param.dim() > 1 and param.requires_grad:
+            # This logic assumes standard nn.Linear and nn.Embedding layers.
+            # You might need to make it more specific if you have other layer types.
+            if "wte.weight" in name or "embedding_layer" in name:
+                param.data = F.normalize(param.data, p=2, dim=1)  # (vocab, d_model)
+            elif "weight" in name:
+                param.data = F.normalize(param.data, p=2, dim=0)  # (out, in)
 
 
 def log_batch(
@@ -497,10 +514,11 @@ def main(
 
     param_grops, ratios_in_group_order = make_param_groups_and_lr_ratios(args, model)
 
+    optimizer_weight_decay = 0.0 if args.use_ngpt else args.weight_decay
     optimizer = torch.optim.AdamW(
         param_grops,
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        weight_decay=optimizer_weight_decay,
         betas=(args.adam_beta1, args.adam_beta2),
     )
 
@@ -581,6 +599,8 @@ def main(
         else disable_profile_schedule_fn
     )
 
+    after_step_callback = normalize_parameters if args.use_ngpt else None
+
     trainer = ConditionalTrainer(
         model=model,
         optimizer=optimizer,
@@ -639,6 +659,7 @@ def main(
         model_active_params=args.model_n_active_params,
         gpu_flops=args.gpu_flops,
         checkpoint_manager_enabled=args.checkpoint_manager,
+        after_step_callback=after_step_callback,
     )
     trainer.train(args.n_steps)
 
