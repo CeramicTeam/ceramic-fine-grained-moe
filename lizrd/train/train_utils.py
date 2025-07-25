@@ -1,5 +1,5 @@
 from typing import Callable, Optional, Union, Type
-
+import argparse
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
@@ -12,6 +12,7 @@ from lizrd.train.load_and_save_model import load_model_weights
 
 
 def get_model(
+    args: argparse.Namespace,
     max_length: int,
     vocab_size: int,
     block_modules: dict[str, Callable[[], torch.nn.Module]],
@@ -35,6 +36,41 @@ def get_model(
     include_positional_embedding: bool = True,
     checkpoint: dict[str, torch.Tensor] = None,
 ):
+    if args.use_ngpt:
+        # 1. Define nGPT-specific layer creation functions
+        attention_layer_fun = lambda: llm.NgptAttention(dm, args.n_att_heads, args)
+
+        # Expert layer for MoE will now be the normalized version
+        expert_layer_fun = lambda: llm.NgptFeedForward(dm, args.dff, args)
+
+        # Determine the feed-forward layer based on ff_mode
+        if args.ff_mode == "expert_choice":
+            ff_layer_fun = lambda: ExpertChoiceFF(
+                dm, args.dff, args.expansion_rate, args.granularity, expert_layer_fun
+            )
+        else:
+            ff_layer_fun = expert_layer_fun
+
+        # 2. Define the block creation function for the TransformerTower
+        # This function will be called by TransformerTower to create each block.
+        # It doesn't need block_modules because nGPTBlock is self-contained.
+        block_creator_fun = lambda: llm.NgptBlock(
+            dmodel=dm,
+            attention_layer=attention_layer_fun(),
+            ff_layer=ff_layer_fun(),
+            args=args,
+        )
+
+        # 3. Override residual_fn because nGPT handles residuals internally
+        residual_fn_override = None
+
+    else:
+        # If not using nGPT, use the block_modules and residual_fn passed from cc_train.py
+        block_creator_fun = lambda: llm.TransformerBlock(
+            dm, block_modules, residual_fn=residual_fn
+        )
+        residual_fn_override = residual_fn
+
     if model_fragmentation is None or device == torch.device("cpu"):
         first_gpu = device
         last_gpu = device
@@ -59,17 +95,25 @@ def get_model(
     encoder_tower = llm.TransformerTower(
         n_blocks,
         dm,
-        block_modules,
+        block_creator_fun,
         device,
         model_fragmentation=model_fragmentation,
-        residual_fn=residual_fn,
+        residual_fn=residual_fn_override,
     )
 
     head = llm.PredictionHead(
         dm, vocab_size, init_type=init_type, init_scale=init_scale
     ).to(last_gpu)
 
-    model = llm.LLM(embedding_layer, encoder_tower, head)
+    model = llm.LLM(
+        embedding_layer,
+        encoder_tower,
+        head,
+        dmodel=dm,
+        vocab_size=vocab_size,
+        use_ngpt=args.use_ngpt,
+        args=args,
+    )
 
     if checkpoint is not None:
         load_model_weights(model, checkpoint)

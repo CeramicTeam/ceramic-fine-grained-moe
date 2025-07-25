@@ -524,4 +524,29 @@ def introduce_parser_arguments(
         help="Single GPU FLOPS, default a100 - Tensor Float32(TF32) 156 TFLOPS",
     )
 
+    # nGPT arguments
+    parser.add_argument("--use_ngpt", action="store_true", help="Use nGPT model")
+    parser.add_argument(
+        "--alpha_a", type=float, default=0.05, help="Eigen learning rate for attention"
+    )
+    parser.add_argument(
+        "--alpha_m", type=float, default=0.05, help="Eigen learning rate for MLP"
+    )
+    parser.add_argument(
+        "--s_qk_init", type=float, default=1.0, help="Initial value for s_qk"
+    )
+    parser.add_argument(
+        "--s_u_init", type=float, default=1.0, help="Initial value for s_u"
+    )
+    parser.add_argument(
+        "--s_v_init", type=float, default=1.0, help="Initial value for s_v"
+    )
+    parser.add_argument(
+        "--s_z_init", type=float, default=1.0, help="Initial value for s_z"
+    )
+    parser.add_argument("--s_qk_scale", type=float, default=None, help="Scale for s_qk")
+    parser.add_argument("--s_u_scale", type=float, default=1.0, help="Scale for s_u")
+    parser.add_argument("--s_v_scale", type=float, default=None, help="Scale for s_v")
+    parser.add_argument("--s_z_scale", type=float, default=None, help="Scale for s_z")
+
     return parser

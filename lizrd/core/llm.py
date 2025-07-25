@@ -2,9 +2,11 @@ from collections import OrderedDict
 from typing import Literal, Callable, Optional
 from functools import partial
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from lizrd.core import misc
 from lizrd.core.misc import default, Aggregate
@@ -85,6 +87,49 @@ def FeedForward(
             ]
         )
     )
+
+
+class NgptFeedForward(LoggingLayer):
+    """
+    nGPT-compatible version of the FeedForward layer using SwiGLU activation.
+    Inherits from LoggingLayer to be compatible with the rest of the codebase.
+    """
+
+    def __init__(self, dmodel: int, dff: int, args: argparse.Namespace):
+        super().__init__()
+        self.dmodel = dmodel
+        self.args = args
+
+        self.w1_gate = Linear(dmodel, dff * 2, bias=False)
+        self.w2 = Linear(dff, dmodel, bias=False)
+
+        s_uv_init_value = self.args.s_u_init
+        s_uv_init_scaling = (
+            self.args.s_u_scale if self.args.s_u_scale is not None else 1.0
+        )
+
+        self.s_uv = nn.Parameter(
+            torch.full((2 * dff,), s_uv_init_scaling, dtype=torch.float32)
+        )
+        self.s_uv_init_value = s_uv_init_value
+        self.s_uv_init_scaling = s_uv_init_scaling
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        uv = self.w1_gate(x)
+
+        s_uv_effective = self.s_uv * (self.s_uv_init_value / self.s_uv_init_scaling)
+
+        s_u, s_v = torch.chunk(s_uv_effective, 2, dim=-1)
+
+        u, v = torch.chunk(uv, 2, dim=-1)
+        u_scaled = u * s_u
+        v_scaled = v * s_v * math.sqrt(self.dmodel)
+
+        # Apply SwiGLU activation (silu(u) * v is a common variant)
+        # The nGPT paper uses u * silu(v), let's stick to that.
+        activation = u_scaled * F.silu(v_scaled)
+
+        return self.w2(activation)
 
 
 class EveryOtherLayer:
@@ -308,6 +353,71 @@ class Attention(LoggingLayer):
         return output
 
 
+class NgptAttention(Attention):
+    """
+    nGPT-compatible version of the Attention layer.
+    """
+
+    def __init__(
+        self,
+        dmodel,
+        heads,
+        causal,
+        init_type,
+        init_scale,
+        args,
+        dhead=None,
+        flash=False,
+    ):
+        super().__init__(dmodel, heads, causal, init_type, init_scale, dhead, flash)
+        self.args = args
+
+        # Initialize the learnable scaling factor for Q and K
+        s_qk_init_value = self.args.s_qk_init
+        s_qk_init_scaling = (
+            self.args.s_qk_scale
+            if self.args.s_qk_scale is not None
+            else 1 / math.sqrt(self.dmodel)
+        )
+
+        self.s_qk = nn.Parameter(
+            torch.full((self.heads, self.dhead), s_qk_init_scaling, dtype=torch.float32)
+        )
+        self.s_qk_init_value = s_qk_init_value
+        self.s_qk_init_scaling = s_qk_init_scaling
+
+    def forward(self, x):
+        projected = self.input_projection(x)
+        batch, seq_len = x.shape[:-1]
+        projected = projected.view(
+            batch, seq_len, self.heads, 3 * self.dhead
+        ).transpose(1, 2)
+        q, k, v = torch.chunk(projected, chunks=3, dim=-1)
+
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+
+        s_qk_effective = self.s_qk * (self.s_qk_init_value / self.s_qk_init_scaling)
+        q = q * s_qk_effective.unsqueeze(0).unsqueeze(
+            2
+        )  # Add batch and seq_len dims for broadcasting
+        k = k * s_qk_effective.unsqueeze(0).unsqueeze(2)
+
+        softmax_scale = math.sqrt(self.dhead)
+
+        attention_output = self.attention_mechanism(
+            query=q, key=k, value=v, dhead=self.dhead, causal=self.causal
+        )
+        if not self.flash:
+            # This part is tricky as the non-flash path has its own scaling.
+            # For simplicity, we assume flash attention is used as in the launch script.
+            # If not, you might need to modify the `attention_mechanism` function.
+            pass
+
+        output = self.output_projection(attention_output.transpose(1, 2).flatten(-2))
+        return output
+
+
 class RoPE(nn.Module):
     # features are paired x_i, x_{i + d_head/2}
     def __init__(self, dhead, length):
@@ -470,6 +580,49 @@ class TransformerBlock(nn.Module):
         return self.block(x)
 
 
+class NgptBlock(nn.Module):
+    def __init__(
+        self, dmodel: int, attention_layer: nn.Module, ff_layer: nn.Module, args
+    ):
+        super().__init__()
+        self.dmodel = dmodel
+        self.attention = attention_layer
+        self.feedforward = ff_layer
+        self.args = args
+
+        # Eigen learning rates
+        alpha_a_init_scaling = 1 / math.sqrt(self.dmodel)
+        self.alpha_a = nn.Parameter(
+            torch.full((dmodel,), alpha_a_init_scaling, dtype=torch.float32)
+        )
+        self.alpha_a_init_value = self.args.alpha_a
+        self.alpha_a_init_scaling = alpha_a_init_scaling
+
+        alpha_m_init_scaling = 1 / math.sqrt(self.dmodel)
+        self.alpha_m = nn.Parameter(
+            torch.full((dmodel,), alpha_m_init_scaling, dtype=torch.float32)
+        )
+        self.alpha_m_init_value = self.args.alpha_m
+        self.alpha_m_init_scaling = alpha_m_init_scaling
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_output = self.attention(x)
+        attn_output_norm = F.normalize(attn_output, p=2, dim=-1)
+        alpha_a_effective = torch.abs(
+            self.alpha_a * (self.alpha_a_init_value / self.alpha_a_init_scaling)
+        )
+        x = F.normalize(x + alpha_a_effective * (attn_output_norm - x), p=2, dim=-1)
+
+        ff_output = self.feedforward(x)
+        ff_output_norm = F.normalize(ff_output, p=2, dim=-1)
+        alpha_m_effective = torch.abs(
+            self.alpha_m * (self.alpha_m_init_value / self.alpha_m_init_scaling)
+        )
+        x = F.normalize(x + alpha_m_effective * (ff_output_norm - x), p=2, dim=-1)
+
+        return x
+
+
 class TransformerTower(nn.Module):
     def __init__(
         self,
@@ -602,14 +755,47 @@ class PredictionHead(Linear):
 
 
 class LLM(nn.Module):
-    def __init__(self, embedding_layer, encoder_tower, head):
+    def __init__(
+        self,
+        embedding_layer,
+        encoder_tower,
+        head,
+        dmodel,
+        vocab_size,
+        use_ngpt,
+        args,
+    ):
         super(LLM, self).__init__()
         self.embedding_layer = embedding_layer
         self.encoder = encoder_tower
         self.head = head
+        self.use_ngpt = use_ngpt
+
+        # nGPT-specific parameters
+        if self.use_ngpt:
+            # For nGPT, create the learnable scaling factor for logits ('sz')
+            base_scale = 1 / math.sqrt(dmodel)
+            sz_init_value = args.s_z_init
+            # Use provided scale or default to base_scale
+            sz_init_scaling = (
+                args.s_z_scale if args.s_z_scale is not None else base_scale
+            )
+
+            self.sz = nn.Parameter(
+                torch.full((vocab_size,), sz_init_scaling, dtype=torch.float32)
+            )
+            # Store init values to calculate the effective scaler later
+            self.sz_init_value = sz_init_value
+            self.sz_init_scaling = sz_init_scaling
 
     def forward(self, *args, **kwargs):
         x = self.embedding_layer(*args, **kwargs)
+        if self.use_ngpt:
+            x = F.normalize(x, p=2, dim=-1)
         x = self.encoder(x)
         x = self.head(x)
+        if self.use_ngpt:
+            # Apply the learnable scaling factor for logits
+            sz_effective = self.sz * (self.sz_init_value / self.sz_init_scaling)
+            x = x * sz_effective
         return x

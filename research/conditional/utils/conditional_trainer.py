@@ -104,6 +104,7 @@ class ConditionalTrainer:
     loaded_training_loop_accumulators: dict = None
     model_active_params: int = 1
     gpu_flops: int = 1
+    after_step_callback: Optional[Callable] = None
 
     def __attrs_post_init__(self):
         if self.mixed_precision_dtype == torch.float16:
@@ -368,6 +369,8 @@ class ConditionalTrainer:
         if self.global_rank is not None:
             dist.all_reduce(torch.tensor(loss, device="cuda"), op=dist.ReduceOp.AVG)
         self._apply_gradient()
+        if self.after_step_callback:
+            self.after_step_callback(self.model)
         self.other_training_states["step_fb_time_acc_sec"] += time() - fb_start
 
         if self.is_logging_process:

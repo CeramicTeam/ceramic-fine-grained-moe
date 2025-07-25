@@ -1,6 +1,7 @@
 import torch
 
 from lizrd.core import llm
+import argparse
 import unittest
 
 from lizrd.support.test_utils import GeneralTestCase
@@ -272,6 +273,7 @@ class LLMTest(GeneralTestCase):
         output_size = 3
         n_blocks = 2
         device = torch.device("cpu")
+        args = argparse.Namespace(use_ngpt=False)
 
         embedding_layer = llm.EmbeddingLayer(
             llm.PositionalEmbedding(
@@ -300,7 +302,16 @@ class LLMTest(GeneralTestCase):
             init_type="kaiming_uniform",
             init_scale=1.0,
         )
-        model = llm.LLM(embedding_layer, encoder_tower, head)
+        model = llm.LLM(
+            embedding_layer,
+            encoder_tower,
+            head,
+            dmodel=dm,
+            vocab_size=vocab_size,
+            use_ngpt=args.use_ngpt,
+            args=args,
+        )
+
         input = torch.randint(0, vocab_size, (batch, seql))
         output = model(input)
         self.assertShape(output, (batch, seql, output_size))
@@ -311,6 +322,7 @@ class LLMTest(GeneralTestCase):
         output_size = 3
         n_blocks = 2
         device = torch.device("cpu")
+        args = argparse.Namespace(use_ngpt=False)
 
         embedding_layer = llm.EmbeddingLayer(
             llm.PositionalEmbedding(
@@ -337,13 +349,17 @@ class LLMTest(GeneralTestCase):
         head = llm.PredictionHead(
             dm, output_size, init_type="kaiming_uniform", init_scale=1.0
         )
-
-        model = llm.LLM(embedding_layer, encoder_tower, head)
-
+        model = llm.LLM(
+            embedding_layer,
+            encoder_tower,
+            head,
+            dmodel=dm,
+            vocab_size=vocab_size,
+            use_ngpt=args.use_ngpt,
+            args=args,
+        )
         input = torch.randint(0, vocab_size, (batch, seql))
-
         output = model(input)
-
         self.assertShape(output, (batch, seql, output_size))
 
 
