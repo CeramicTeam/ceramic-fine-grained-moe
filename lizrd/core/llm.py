@@ -98,10 +98,23 @@ class NgptFeedForward(LoggingLayer):
     def __init__(self, dmodel: int, dff: int, args: argparse.Namespace):
         super().__init__()
         self.dmodel = dmodel
+        self.doutput = dmodel
         self.args = args
 
-        self.w1_gate = Linear(dmodel, dff * 2, bias=False)
-        self.w2 = Linear(dff, dmodel, bias=False)
+        self.w1_gate = Linear(
+            dmodel, 
+            dff * 2, 
+            bias=False, 
+            init_type=args.init_type, 
+            init_scale=args.init_scale
+        )
+        self.w2 = Linear(
+            dff, 
+            dmodel, 
+            bias=False, 
+            init_type=args.init_type, 
+            init_scale=args.init_scale
+        )
 
         s_uv_init_value = self.args.s_u_init
         s_uv_init_scaling = (
@@ -119,6 +132,8 @@ class NgptFeedForward(LoggingLayer):
 
         s_uv_effective = self.s_uv * (self.s_uv_init_value / self.s_uv_init_scaling)
 
+        self.update_cache_for_logging("s_uv_mean", s_uv_effective.mean())
+
         s_u, s_v = torch.chunk(s_uv_effective, 2, dim=-1)
 
         u, v = torch.chunk(uv, 2, dim=-1)
@@ -130,6 +145,11 @@ class NgptFeedForward(LoggingLayer):
         activation = u_scaled * F.silu(v_scaled)
 
         return self.w2(activation)
+
+    def log_heavy(self):
+        if "s_uv_mean" in self.logging_cache:
+            return {"s_uv_mean": self.logging_cache["s_uv_mean"]}
+        return {}
 
 
 class EveryOtherLayer:
@@ -242,8 +262,13 @@ def attention_mechanism(
     dhead: int,
     causal: bool,
     flash: bool,
+    use_ngpt_scaling: bool = False,
 ):
     if flash:
+        if use_ngpt_scaling:
+            scale = None
+        else:
+            (1 / dhead**0.5)
         with torch.backends.cuda.sdp_kernel(
             enable_flash=True, enable_math=False, enable_mem_efficient=False
         ):
@@ -253,6 +278,7 @@ def attention_mechanism(
                 value=value.contiguous(),
                 attn_mask=None,
                 is_causal=causal,
+                scale=scale
             )
     else:
         # implementation without flash assumes other dim order
@@ -261,7 +287,8 @@ def attention_mechanism(
         value = value.transpose(1, 2)
 
         a = torch.einsum("... l h d, ... L h d -> ... h l L", query, key)
-        a = a * (1 / dhead**0.5)
+        if not use_ngpt_scaling:
+            a = a * (1 / dhead**0.5)
         if causal:
             a.masked_fill_(
                 torch.tril(torch.ones_like(a)) == 0, float("-inf")
@@ -285,6 +312,7 @@ class AttentionMechanism(nn.Module):
         value: torch.Tensor,
         dhead: int,
         causal: bool,
+        use_ngpt_scaling: bool = False,
         *args,
         **kwargs,
     ):
@@ -295,6 +323,7 @@ class AttentionMechanism(nn.Module):
             dhead=dhead,
             causal=causal,
             flash=self.use_flash_attention,
+            use_ngpt_scaling=use_ngpt_scaling
         )
 
 
@@ -371,6 +400,7 @@ class NgptAttention(Attention):
     ):
         super().__init__(dmodel, heads, causal, init_type, init_scale, dhead, flash)
         self.args = args
+        self.dmodel = dmodel
 
         # Initialize the learnable scaling factor for Q and K
         s_qk_init_value = self.args.s_qk_init
@@ -398,24 +428,27 @@ class NgptAttention(Attention):
         k = F.normalize(k, p=2, dim=-1)
 
         s_qk_effective = self.s_qk * (self.s_qk_init_value / self.s_qk_init_scaling)
-        q = q * s_qk_effective.unsqueeze(0).unsqueeze(
-            2
-        )  # Add batch and seq_len dims for broadcasting
+        self.update_cache_for_logging("s_qk_mean", s_qk_effective.mean())
+        # Scale Q and K by the learnable scaling factor
+        q = q * s_qk_effective.unsqueeze(0).unsqueeze(2)  # Add batch and seq_len dims for broadcasting
         k = k * s_qk_effective.unsqueeze(0).unsqueeze(2)
 
+        # The nGPT paper states the scaling factor should be sqrt(d_head).
+        # We pre-scale q to achieve this inside the attention function.
         softmax_scale = math.sqrt(self.dhead)
+        q = q * softmax_scale
 
         attention_output = self.attention_mechanism(
-            query=q, key=k, value=v, dhead=self.dhead, causal=self.causal
+            query=q, key=k, value=v, dhead=self.dhead, causal=self.causal, use_ngpt_scaling=True
         )
-        if not self.flash:
-            # This part is tricky as the non-flash path has its own scaling.
-            # For simplicity, we assume flash attention is used as in the launch script.
-            # If not, you might need to modify the `attention_mechanism` function.
-            pass
 
         output = self.output_projection(attention_output.transpose(1, 2).flatten(-2))
         return output
+
+    def log_heavy(self):
+        if "s_qk_mean" in self.logging_cache:
+            return {"s_qk_mean": self.logging_cache["s_qk_mean"]}
+        return {}
 
 
 class RoPE(nn.Module):
@@ -580,7 +613,7 @@ class TransformerBlock(nn.Module):
         return self.block(x)
 
 
-class NgptBlock(nn.Module):
+class NgptBlock(LoggingLayer):
     def __init__(
         self, dmodel: int, attention_layer: nn.Module, ff_layer: nn.Module, args
     ):
@@ -606,21 +639,51 @@ class NgptBlock(nn.Module):
         self.alpha_m_init_scaling = alpha_m_init_scaling
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.update_cache_for_logging("input_norm", x.norm(p=2, dim=-1).mean())
+
+        # Attention block with nGPT residual update
         attn_output = self.attention(x)
         attn_output_norm = F.normalize(attn_output, p=2, dim=-1)
         alpha_a_effective = torch.abs(
             self.alpha_a * (self.alpha_a_init_value / self.alpha_a_init_scaling)
         )
+
+        self.update_cache_for_logging("alpha_a_mean", alpha_a_effective.mean())
+
         x = F.normalize(x + alpha_a_effective * (attn_output_norm - x), p=2, dim=-1)
 
+        # FeedForward/MoE block with nGPT residual update
         ff_output = self.feedforward(x)
         ff_output_norm = F.normalize(ff_output, p=2, dim=-1)
         alpha_m_effective = torch.abs(
             self.alpha_m * (self.alpha_m_init_value / self.alpha_m_init_scaling)
         )
-        x = F.normalize(x + alpha_m_effective * (ff_output_norm - x), p=2, dim=-1)
 
+        self.update_cache_for_logging("alpha_m_mean", alpha_m_effective.mean())
+        x = F.normalize(x + alpha_m_effective * (ff_output_norm - x), p=2, dim=-1)
+        self.update_cache_for_logging("output_norm", x.norm(p=2, dim=-1).mean())
         return x
+
+    def log_heavy(self):
+        """
+        This method is called by the trainer to collect the metrics to be logged.
+        """
+        # The values were already averaged in the forward pass, so we just retrieve them.
+        logs = {
+            "input_norm": self.logging_cache["input_norm"],
+            "alpha_a_mean": self.logging_cache["alpha_a_mean"],
+            "alpha_m_mean": self.logging_cache["alpha_m_mean"],
+            "output_norm": self.logging_cache["output_norm"],
+        }
+        
+        # It's good practice to also include logs from child LoggingLayers
+        # if they have their own log_heavy methods.
+        if hasattr(self.attention, "log_heavy"):
+            logs.update(self.attention.log_heavy())
+        if hasattr(self.feedforward, "log_heavy"):
+            logs.update(self.feedforward.log_heavy())
+            
+        return logs
 
 
 class TransformerTower(nn.Module):
@@ -640,8 +703,6 @@ class TransformerTower(nn.Module):
             for layer in layer_or_block_definition:
                 misc.check_layer_funs(*layer)
             assert len(layer_or_block_definition) == n_blocks
-        else:
-            raise ValueError("layer_definition must be dict or list")
 
         self.blocks = []
         self.model_fragmentation = (
@@ -649,34 +710,39 @@ class TransformerTower(nn.Module):
         )
         self.device = device
 
-        if type(layer_or_block_definition) is dict:
-            block_definitions = [layer_or_block_definition] * n_blocks
-        else:
-            block_definitions = layer_or_block_definition
-
-        for i_block, layer_dict in enumerate(block_definitions):
-            layers_info = [
-                (name, layer_fun()) for name, layer_fun in layer_dict.items()
-            ]
-
-            for name, layer in layers_info:
-                layer.layer_type = name
-                layer.block_number = i_block
-
+        for i_block in range(n_blocks):
             _, current_device = self.get_current_device(i_block)
-            block = TransformerBlock(
-                dmodel,
-                layers_info,
-                residual_fn,
-            )
+
+            # We use `residual_fn` as a signal to determine which block type to build.
+            # If it's None, we know it's an nGPT run.
+            if residual_fn is None:
+                block = layer_or_block_definition()
+            else:
+                # This is the original logic for standard blocks
+                layer_dict = layer_or_block_definition
+                if isinstance(layer_or_block_definition, list):
+                    layer_dict = layer_or_block_definition[i_block]
+                
+                layers_info = [
+                    (name, layer_fun()) for name, layer_fun in layer_dict.items()
+                ]
+
+                for name, layer in layers_info:
+                    layer.layer_type = name
+                    layer.block_number = i_block
+                
+                block = TransformerBlock(
+                    dmodel,
+                    layers_info,
+                    residual_fn,
+                )
+
             if current_device != torch.device("cpu"):
                 block = block.to(current_device)
 
-            name_and_block = (
-                f"block_{i_block}",
-                block,
-            )
+            name_and_block = (f"block_{i_block}", block)
             self.blocks.append(name_and_block)
+        
         self.blocks = nn.Sequential(OrderedDict(self.blocks))
 
     def forward(self, x):
@@ -748,10 +814,35 @@ class EmbeddingLayer(Aggregate):
 
 
 class PredictionHead(Linear):
-    def __init__(self, embedding_dim, output_size, init_type, init_scale):
+    def __init__(self, embedding_dim, output_size, init_type, init_scale, use_ngpt=False, args=None):
         super(PredictionHead, self).__init__(
             embedding_dim, output_size, init_type=init_type, init_scale=init_scale
         )
+        self.use_ngpt = use_ngpt
+        if self.use_ngpt:
+            print(f"Using nGPT scaling in PredictionHead with output size {output_size} and embedding dim {embedding_dim}")
+            # For nGPT, create the learnable scaling factor for logits ('sz')
+            base_scale = 1 / math.sqrt(embedding_dim)
+            sz_init_value = args.s_z_init
+            # Use provided scale or default to base_scale
+            sz_init_scaling = (
+                args.s_z_scale if args.s_z_scale is not None else base_scale
+            )
+
+            self.sz = nn.Parameter(
+                torch.full((output_size,), sz_init_scaling, dtype=torch.float32)
+            )
+            # Store init values to calculate the effective scaler later
+            self.sz_init_value = sz_init_value
+            self.sz_init_scaling = sz_init_scaling
+    def forward(self, x):
+        # Call the parent Linear's forward method
+        logits = super().forward(x)
+        if self.use_ngpt:
+            # Apply the learnable scaling factor for logits
+            sz_effective = self.sz * (self.sz_init_value / self.sz_init_scaling)
+            logits = logits * sz_effective
+        return logits
 
 
 class LLM(nn.Module):
@@ -760,33 +851,13 @@ class LLM(nn.Module):
         embedding_layer,
         encoder_tower,
         head,
-        dmodel,
-        vocab_size,
-        use_ngpt,
-        args,
+        args
     ):
         super(LLM, self).__init__()
         self.embedding_layer = embedding_layer
         self.encoder = encoder_tower
         self.head = head
-        self.use_ngpt = use_ngpt
-
-        # nGPT-specific parameters
-        if self.use_ngpt:
-            # For nGPT, create the learnable scaling factor for logits ('sz')
-            base_scale = 1 / math.sqrt(dmodel)
-            sz_init_value = args.s_z_init
-            # Use provided scale or default to base_scale
-            sz_init_scaling = (
-                args.s_z_scale if args.s_z_scale is not None else base_scale
-            )
-
-            self.sz = nn.Parameter(
-                torch.full((vocab_size,), sz_init_scaling, dtype=torch.float32)
-            )
-            # Store init values to calculate the effective scaler later
-            self.sz_init_value = sz_init_value
-            self.sz_init_scaling = sz_init_scaling
+        self.use_ngpt = args.use_ngpt
 
     def forward(self, *args, **kwargs):
         x = self.embedding_layer(*args, **kwargs)
@@ -794,8 +865,4 @@ class LLM(nn.Module):
             x = F.normalize(x, p=2, dim=-1)
         x = self.encoder(x)
         x = self.head(x)
-        if self.use_ngpt:
-            # Apply the learnable scaling factor for logits
-            sz_effective = self.sz * (self.sz_init_value / self.sz_init_scaling)
-            x = x * sz_effective
         return x

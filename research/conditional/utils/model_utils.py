@@ -257,6 +257,17 @@ def calculate_llm_loss_and_gradient(
 
 
 def get_attention_layer(args):
+    if args.use_ngpt:
+        return lambda: llm.NgptAttention(
+            dmodel=args.dmodel,
+            heads=args.n_att_heads,
+            causal=True,
+            init_type=args.init_type,
+            init_scale=args.init_scale,
+            args=args,
+            flash=args.flash_attention,
+            dhead=args.dhead,
+        )
     causal = args.model_type == "gpt"
     if args.attention_mode == "vanilla":
         attention_layer_fun = lambda: llm.Attention(
@@ -605,6 +616,7 @@ def get_ff_layer(args):
     elif args.ff_mode == "expert_choice":
         args = determine_moe_args(args)
         ff_args, make_expert_inner_function = get_expert_choice_args(args)
+        print("model utils: ff_args", ff_args)
         return_fn = lambda: ExpertChoiceFF(
             **ff_args,
             expert_inner_function=make_expert_inner_function(),
@@ -728,6 +740,12 @@ def get_ff_layer(args):
 
 
 def get_inner_expert(args):
+    if args.use_ngpt:
+        print("Using nGPT inner expert")
+        # For nGPT, the only expert type is NgptFeedForward
+        return lambda **kwargs: llm.NgptFeedForward(
+            dmodel=args.dmodel, dff=args.dff, args=args
+        )
     if args.moe_inner_expert == "ff":
         expert_inner_class = partial(ExpertFF, activation_name=args.activation_type)
     elif args.moe_inner_expert == "ff_gated":
@@ -853,14 +871,20 @@ def get_classes_from_module_names(
             classes.append(llm.AttentionRoPE)
         elif name == "AttentionMechanism":
             classes.append(llm.AttentionMechanism)
+        elif name == "NgptAttention":
+            classes.append(llm.NgptAttention)
         elif name == "RoPE":
             classes.append(llm.RoPE)
         elif name == "FeedForward":
             classes.append(llm.FeedForward)
+        elif name == "NgptFeedForward":
+            classes.append(llm.NgptFeedForward)
         elif name == "Residual":
             classes.append(llm.Residual)
         elif name == "TransformerBlock":
             classes.append(llm.TransformerBlock)
+        elif name == "NgptBlock":
+            classes.append(llm.NgptBlock)
         elif name == "TransformerTower":
             classes.append(llm.TransformerTower)
         elif name == "LLM":

@@ -9,6 +9,10 @@ from lizrd.core import llm
 from lizrd.core.distributed import wrap_in_fsdp, wrap_in_ddp
 from lizrd.train.checkpointing import make_checkpoint_wrapper_function
 from lizrd.train.load_and_save_model import load_model_weights
+from research.conditional.utils.model_utils import (
+    get_ff_layer,
+    get_attention_layer,
+)
 
 
 def get_model(
@@ -37,39 +41,27 @@ def get_model(
     checkpoint: dict[str, torch.Tensor] = None,
 ):
     if args.use_ngpt:
-        # 1. Define nGPT-specific layer creation functions
-        attention_layer_fun = lambda: llm.NgptAttention(dm, args.n_att_heads, args)
-
-        # Expert layer for MoE will now be the normalized version
-        expert_layer_fun = lambda: llm.NgptFeedForward(dm, args.dff, args)
-
-        # Determine the feed-forward layer based on ff_mode
-        if args.ff_mode == "expert_choice":
-            ff_layer_fun = lambda: ExpertChoiceFF(
-                dm, args.dff, args.expansion_rate, args.granularity, expert_layer_fun
-            )
-        else:
-            ff_layer_fun = expert_layer_fun
-
-        # 2. Define the block creation function for the TransformerTower
-        # This function will be called by TransformerTower to create each block.
-        # It doesn't need block_modules because nGPTBlock is self-contained.
+        print("Using nGPT model configuration...")
+        block_modules = {
+            "attention": get_attention_layer(args),
+            "feedforward": get_ff_layer(args),
+        }
+        Define the nGPT block creator
         block_creator_fun = lambda: llm.NgptBlock(
             dmodel=dm,
-            attention_layer=attention_layer_fun(),
-            ff_layer=ff_layer_fun(),
+            attention_layer=block_modules["attention"](),
+            ff_layer=block_modules["feedforward"](),
             args=args,
         )
-
-        # 3. Override residual_fn because nGPT handles residuals internally
+        # We pass the creator function itself to the tower.
+        block_modules_override = block_creator_fun 
+        # Residual function is not used when we create the block directly.
         residual_fn_override = None
 
     else:
         # If not using nGPT, use the block_modules and residual_fn passed from cc_train.py
-        block_creator_fun = lambda: llm.TransformerBlock(
-            dm, block_modules, residual_fn=residual_fn
-        )
-        residual_fn_override = residual_fn
+        block_modules_override = block_modules
+        residual_fn_override = residual_fn  
 
     if model_fragmentation is None or device == torch.device("cpu"):
         first_gpu = device
@@ -95,24 +87,26 @@ def get_model(
     encoder_tower = llm.TransformerTower(
         n_blocks,
         dm,
-        block_creator_fun,
-        device,
+        layer_or_block_definition=block_modules_override,
+        device=device,
         model_fragmentation=model_fragmentation,
         residual_fn=residual_fn_override,
     )
 
     head = llm.PredictionHead(
-        dm, vocab_size, init_type=init_type, init_scale=init_scale
+        dm,
+        vocab_size,
+        init_type=init_type,
+        init_scale=init_scale,
+        use_ngpt=args.use_ngpt,
+        args=args
     ).to(last_gpu)
 
     model = llm.LLM(
         embedding_layer,
         encoder_tower,
         head,
-        dmodel=dm,
-        vocab_size=vocab_size,
-        use_ngpt=args.use_ngpt,
-        args=args,
+        args=args
     )
 
     if checkpoint is not None:
