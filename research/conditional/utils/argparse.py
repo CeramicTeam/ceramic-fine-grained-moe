@@ -13,6 +13,10 @@ def math_eval(value):
 def introduce_parser_arguments(
     parser: argparse.ArgumentParser,
 ) -> argparse.ArgumentParser:
+    # Add a dummy argument to accept the --local-rank from torch.distributed.launch
+    parser.add_argument(
+        "--local-rank", type=int, default=0, help="DDP necessity, given by torch"
+    )
     # CORE model hyperparameters, almost always specified in baseline configs
     parser.add_argument("--cuda_visible", type=str, default=None)
     parser.add_argument(
