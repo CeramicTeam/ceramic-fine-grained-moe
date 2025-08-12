@@ -34,6 +34,7 @@ from lizrd.support.misc import (
 from lizrd.train.checkpoints_manager import start_job_manager_assessment
 from lizrd.train.train_utils import (
     get_model,
+    normalize_parameters_for_fsdp_context,
 )
 from lizrd.text import tokenizers
 from research.batch_size_rampup_config import BatchSizeRampupConfig
@@ -68,23 +69,6 @@ from lizrd.train.load_and_save_model import (
     load_optimizer_state,
     prepare_save_weights_path,
 )
-
-
-def normalize_parameters(model: torch.nn.Module):
-    """
-    Normalize the weights of the model's layers to have unit norm.
-    This is performed after each optimizer step for nGPT.
-    """
-    for name, param in model.named_parameters():
-        # We only normalize weight tensors (2D or more) that require gradients
-        if param.dim() > 1 and param.requires_grad:
-            # This logic assumes standard nn.Linear and nn.Embedding layers.
-            # You might need to make it more specific if you have other layer types.
-            if "wte.weight" in name or "embedding_layer" in name:
-                param.data = F.normalize(param.data, p=2, dim=1)  # (vocab, d_model)
-            elif "weight" in name:
-                param.data = F.normalize(param.data, p=2, dim=0)  # (out, in)
-
 
 def log_batch(
     wrapper: DataloaderWrapper,
@@ -604,7 +588,7 @@ def main(
         else disable_profile_schedule_fn
     )
 
-    after_step_callback = normalize_parameters if args.use_ngpt else None
+    after_step_callback = normalize_parameters_for_fsdp_context if args.use_ngpt else None
 
     trainer = ConditionalTrainer(
         model=model,

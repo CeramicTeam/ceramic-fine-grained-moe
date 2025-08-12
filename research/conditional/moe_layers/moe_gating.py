@@ -1,5 +1,6 @@
 from typing import Union, Literal
 import torch
+import math
 from fancy_einsum import einsum
 from plotly import express as px
 
@@ -42,6 +43,13 @@ class MoeGating(LoggingLayer):
         self.use_torch_bmm = use_torch_bmm
         self.detach_gate = detach_gate
         self.zloss_weight = zloss_weight
+        
+        self.gate_scale_init_value = 14
+        self.gate_scale_init_scaling = 1.0
+        self.gate_scale = torch.nn.Parameter(
+            torch.full((1,), self.gate_scale_init_scaling, dtype=torch.float32)
+        )
+
         self.gate, self.get_gate = self.init_gate(
             expert_inner_function,
             get_router_values_from,
@@ -74,6 +82,13 @@ class MoeGating(LoggingLayer):
                     x,
                     self.get_gate(),
                 )
+        gate_scale_effective = self.gate_scale * (
+            self.gate_scale_init_value / self.gate_scale_init_scaling
+        )
+        gate_logits = gate_logits * gate_scale_effective
+        # Log the effective value to monitor its growth
+        self.update_cache_for_logging("gate_scale_effective", gate_scale_effective.data.item())
+
         # each expert chooses k within dimension 1
         if not self.group_by_batch and not self.softmax_ungrouped:
             gate_logits = gate_logits.reshape(self.n_experts, batch_size * seq_len)
@@ -250,6 +265,7 @@ class ExpertGating(MoeGating):
                 self.logging_cache["gate_softmax_all_values"].flatten()
             ),
             "indexes_choose_counts": make_histogram(indexes_choose_counts),
+            "gate_scale_effective": self.logging_cache["gate_scale_effective"],
             **uf_gate_out,
         }
 
