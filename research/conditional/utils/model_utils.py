@@ -258,10 +258,11 @@ def calculate_llm_loss_and_gradient(
 
 def get_attention_layer(args):
     if args.use_ngpt:
-        return lambda: llm.NgptAttention(
+        return lambda: llm.NgptAttentionRoPE(
             dmodel=args.dmodel,
             heads=args.n_att_heads,
             causal=True,
+            length=args.cutoff,
             init_type=args.init_type,
             init_scale=args.init_scale,
             args=args,
@@ -548,6 +549,11 @@ def get_common_mot_kwargs(args):
 
 
 def get_ff_layer(args):
+    if args.use_ngpt and args.ff_mode in ["ngpt_ff"]:
+        print("Creating a dense nGPT FeedForward layer (NgptFeedForward).")
+        return lambda: llm.NgptFeedForward(
+            dmodel=args.dmodel, dff=args.dff, args=args
+        )
     if args.ff_mode == "vanilla":
         return_fn = lambda: llm.FeedForward(
             args.dmodel, args.dff, init_type=args.init_type, init_scale=args.init_scale
@@ -616,7 +622,6 @@ def get_ff_layer(args):
     elif args.ff_mode == "expert_choice":
         args = determine_moe_args(args)
         ff_args, make_expert_inner_function = get_expert_choice_args(args)
-        print("model utils: ff_args", ff_args)
         return_fn = lambda: ExpertChoiceFF(
             **ff_args,
             expert_inner_function=make_expert_inner_function(),
@@ -721,30 +726,34 @@ def get_ff_layer(args):
         raise NotImplementedError(f"FF mode {args.ff_mode} not implemented")
 
     if args.every_other_layer:
-        if args.standard_ff_first:
-            return_fn = llm.EveryOtherLayer(
-                lambda: llm.FeedForward(args.dmodel, args.dff), return_fn
+        # Define the standard/dense feed-forward layer based on whether nGPT is used
+        if args.use_ngpt:
+            # For nGPT, the dense layer is NgptFeedForward
+            standard_ff_fn = lambda: llm.NgptFeedForward(
+                dmodel=args.dmodel, dff=args.dff, args=args
             )
         else:
-            return_fn = llm.EveryOtherLayer(
-                return_fn,
-                lambda: llm.FeedForward(
-                    args.dmodel,
-                    args.dff,
-                    init_type=args.init_type,
-                    init_scale=args.init_scale,
-                ),
+            # For standard models, use SwiGLU as a strong dense baseline
+            standard_ff_fn = lambda: llm.SwiGLUFeedForward(
+                dmodel=args.dmodel,
+                dff=args.dff,
+                init_type=args.init_type,
+                init_scale=args.init_scale,
             )
+
+        if args.standard_ff_first:
+            return llm.EveryOtherLayer(standard_ff_fn, return_fn)
+        else:
+            return llm.EveryOtherLayer(return_fn, standard_ff_fn)
 
     return return_fn
 
 
 def get_inner_expert(args):
     if args.use_ngpt:
-        print("Using nGPT inner expert")
         # For nGPT, the only expert type is NgptFeedForward
         return lambda **kwargs: llm.NgptFeedForward(
-            dmodel=args.dmodel, dff=args.dff, args=args
+            dmodel=args.dmodel, dff=args.expert_size, args=args
         )
     if args.moe_inner_expert == "ff":
         expert_inner_class = partial(ExpertFF, activation_name=args.activation_type)

@@ -25,6 +25,7 @@ from lizrd.train.checkpoints_manager import (
     job_out_of_time_checkpoint,
 )
 from lizrd.train.scheduler import AbstractLRScheduler
+from lizrd.train.train_utils import log_normalization_verification
 from research.batch_size_rampup_config import BatchSizeRampupConfig
 from research.conditional.moe_layers.continuous_moe import ContinuousMoE
 from research.conditional.moe_layers._expert_choice_old import ExpertChoiceFFOld
@@ -369,8 +370,14 @@ class ConditionalTrainer:
         if self.global_rank is not None:
             dist.all_reduce(torch.tensor(loss, device="cuda"), op=dist.ReduceOp.AVG)
         self._apply_gradient()
+
         if self.after_step_callback:
-            self.after_step_callback(self.model)
+            with FSDP.summon_full_params(self.model, writeback=True):
+                self.after_step_callback(self.model)
+
+                if self.is_logging_process and step < 5:
+                    log_normalization_verification(self.model, step)
+        
         self.other_training_states["step_fb_time_acc_sec"] += time() - fb_start
 
         if self.is_logging_process:

@@ -79,7 +79,7 @@ def get_model_configuration_for_active_param_calculation(args):
         active_ratio = 1
         dff = args.dff
 
-    elif args.ff_mode in ["swi_glu"]:
+    elif args.ff_mode in ["swi_glu", "ngpt_ff"]:
         isgated = True
         active_ratio = 1
         dff = args.dff
